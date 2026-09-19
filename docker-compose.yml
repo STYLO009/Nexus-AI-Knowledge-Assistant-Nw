@@ -1,0 +1,70 @@
+services:
+  web:
+    build:
+      context: .
+      args:
+        VITE_GOOGLE_CLIENT_ID: ${VITE_GOOGLE_CLIENT_ID:-}
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://nexus:nexus@postgres:5432/nexus
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      LANGCHAIN_EMBEDDING_MODEL: ${LANGCHAIN_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      LANGCHAIN_EMBEDDING_DEVICE: ${LANGCHAIN_EMBEDDING_DEVICE:-cpu}
+      LANGCHAIN_EMBEDDING_NORMALIZE: ${LANGCHAIN_EMBEDDING_NORMALIZE:-true}
+      LANGCHAIN_EMBEDDING_BATCH_SIZE: ${LANGCHAIN_EMBEDDING_BATCH_SIZE:-32}
+      LANGCHAIN_EMBEDDING_CACHE: ${LANGCHAIN_EMBEDDING_CACHE:-/models/huggingface}
+      LANGCHAIN_EMBEDDING_SHOW_PROGRESS: ${LANGCHAIN_EMBEDDING_SHOW_PROGRESS:-false}
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-false}
+      LANGCHAIN_PROJECT: ${LANGCHAIN_PROJECT:-nexus-rag}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      QDRANT_URL: http://qdrant:6333
+      CORS_ORIGIN: http://localhost:8080
+      LANGCHAIN_HF_GENERATION_MODEL: ${LANGCHAIN_HF_GENERATION_MODEL:-HuggingFaceTB/SmolLM2-360M-Instruct}
+      LANGCHAIN_HF_GENERATION_DEVICE: ${LANGCHAIN_HF_GENERATION_DEVICE:--1}
+      LANGCHAIN_HF_MAX_NEW_TOKENS: ${LANGCHAIN_HF_MAX_NEW_TOKENS:-256}
+      HUGGINGFACEHUB_API_TOKEN: ${HUGGINGFACEHUB_API_TOKEN:-}
+      HF_TOKEN: ${HF_TOKEN:-}
+      MAX_UPLOAD_SIZE_BYTES: ${MAX_UPLOAD_SIZE_BYTES:-52428800}
+    depends_on:
+      qdrant:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    volumes:
+      - hf_models:/models/huggingface
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: nexus
+      POSTGRES_USER: nexus
+      POSTGRES_PASSWORD: nexus
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nexus -d nexus"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  qdrant_data:
+  postgres_data:
+  hf_models:

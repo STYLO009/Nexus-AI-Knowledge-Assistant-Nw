@@ -1,0 +1,10 @@
+{
+  "description": "This AI Knowledge Assistant streamlines information retrieval and document comparison, enhancing productivity for professionals with real-time chat and citation features.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
