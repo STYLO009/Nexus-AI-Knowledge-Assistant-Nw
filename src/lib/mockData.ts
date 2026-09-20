@@ -1,4 +1,5 @@
-import type { Document, ChatSession, DashboardStats } from './types';
+import type { Document, ChatSession } from './types';
+import type { DashboardStats } from './api';
 
 export const MOCK_DOCUMENTS: Document[] = [
   {
@@ -91,25 +92,18 @@ export const MOCK_SESSIONS: ChatSession[] = [
 
 export const MOCK_STATS: DashboardStats = {
   totalDocuments: 5,
-  totalChats: 23,
-  totalQueries: 187,
-  avgResponseTime: 1.4,
+  totalChunks: 447,
+  totalTokens: 257320,
+  indexedDocuments: 4,
+  processingDocuments: 1,
+  errorDocuments: 0,
   documentsThisWeek: 3,
-  queriesThisWeek: 64,
+  chunksThisWeek: 261,
   topDocuments: [
-    { name: 'LangChain Architecture Guide', queries: 48 },
-    { name: 'RAG Pipeline Best Practices', queries: 37 },
-    { name: 'FastAPI Security Hardening', queries: 29 },
-    { name: 'Vector Database Comparison', queries: 21 },
-  ],
-  queryVolume: [
-    { date: 'Sep 13', count: 12 },
-    { date: 'Sep 14', count: 19 },
-    { date: 'Sep 15', count: 28 },
-    { date: 'Sep 16', count: 22 },
-    { date: 'Sep 17', count: 31 },
-    { date: 'Sep 18', count: 41 },
-    { date: 'Sep 19', count: 34 },
+    { name: 'LangChain Architecture Guide', chunks: 142, tokens: 84320 },
+    { name: 'RAG Pipeline Best Practices', chunks: 41, tokens: 24500 },
+    { name: 'FastAPI Security Hardening', chunks: 186, tokens: 102400 },
+    { name: 'Vector Database Comparison', chunks: 78, tokens: 46100 },
   ],
 };
 

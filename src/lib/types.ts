@@ -45,15 +45,4 @@ export interface ChatSession {
   documentIds: string[];
 }
 
-export interface DashboardStats {
-  totalDocuments: number;
-  totalChats: number;
-  totalQueries: number;
-  avgResponseTime: number;
-  documentsThisWeek: number;
-  queriesThisWeek: number;
-  topDocuments: { name: string; queries: number }[];
-  queryVolume: { date: string; count: number }[];
-}
-
 export type Page = 'login' | 'dashboard' | 'chat' | 'documents' | 'comparison' | 'settings' | 'api-docs';

@@ -19,8 +19,10 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
-.git/
-.github/
+.env
+.env.*
+!.env.example
+
 
 .figma/design-context/
 

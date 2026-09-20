@@ -280,54 +280,220 @@ def list_documents() -> list[dict[str, Any]]:
     return [document_from_row(cast(dict[str, Any], row)) for row in rows]
 
 
+@app.delete("/api/documents/{doc_id}")
+async def delete_document(doc_id: str) -> dict[str, str]:
+    # Delete vectors from Qdrant
+    try:
+        qdrant.delete(collection_name=COLLECTION, points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
+            )
+        ))
+    except Exception:
+        logger.warning("Failed to delete vectors for doc_id=%s (may not exist)", doc_id)
+    # Delete from database
+    with psycopg.connect(DATABASE_URL) as connection:
+        result = connection.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Document not found.")
+    return {"status": "deleted"}
+
+
+@app.get("/api/stats")
+def get_stats() -> dict[str, Any]:
+    with psycopg.connect(DATABASE_URL, row_factory=cast(Any, dict_row)) as connection:
+        row = connection.execute(
+            """
+            SELECT
+                COUNT(*)::int AS total_documents,
+                COALESCE(SUM(chunks), 0)::int AS total_chunks,
+                COALESCE(SUM(tokens), 0)::int AS total_tokens,
+                COUNT(*) FILTER (WHERE status = 'indexed')::int AS indexed_documents,
+                COUNT(*) FILTER (WHERE status = 'processing')::int AS processing_documents,
+                COUNT(*) FILTER (WHERE status = 'error')::int AS error_documents,
+                COUNT(*) FILTER (WHERE uploaded_at >= NOW() - INTERVAL '7 days')::int AS documents_this_week,
+                COALESCE(SUM(chunks) FILTER (WHERE uploaded_at >= NOW() - INTERVAL '7 days'), 0)::int AS chunks_this_week
+            FROM documents
+            """
+        ).fetchone()
+        # Top documents by chunk count
+        top_rows = connection.execute(
+            "SELECT name, chunks, tokens FROM documents WHERE status = 'indexed' ORDER BY chunks DESC LIMIT 5"
+        ).fetchall()
+    r = cast(dict[str, Any], row)
+    return {
+        "totalDocuments": r["total_documents"],
+        "totalChunks": r["total_chunks"],
+        "totalTokens": r["total_tokens"],
+        "indexedDocuments": r["indexed_documents"],
+        "processingDocuments": r["processing_documents"],
+        "errorDocuments": r["error_documents"],
+        "documentsThisWeek": r["documents_this_week"],
+        "chunksThisWeek": r["chunks_this_week"],
+        "topDocuments": [
+            {"name": t["name"], "chunks": t["chunks"], "tokens": t["tokens"]}
+            for t in top_rows
+        ],
+    }
+
+
 @app.post("/api/documents/upload")
 async def upload_document(file: UploadFile = File(...)) -> dict[str, Any]:
     content = await file.read()
     if len(content) > MAX_UPLOAD_SIZE_BYTES:
         max_size_mb = MAX_UPLOAD_SIZE_BYTES / (1024 * 1024)
         raise HTTPException(status_code=413, detail=f"File exceeds the {max_size_mb:g} MB upload limit.")
-    pages = extract_pages(file.filename or "document.txt", content)
+
+    doc_id = str(uuid.uuid4())
+    name = file.filename or "document.txt"
+    doc_type = Path(name).suffix.lstrip(".") or "txt"
+
+    # Quick parse to validate the file has extractable text before inserting
+    pages = extract_pages(name, content)
     chunks = chunk_pages(pages)
-    text = "\n".join(page["text"] for page in pages)
-    ocr_pages = sum(page["extraction"] == "ocr" for page in pages)
-    logger.info("Parsed upload filename=%s bytes=%d pages=%d characters=%d chunks=%d ocr_pages=%d", file.filename, len(content), len(pages), len(text), len(chunks), ocr_pages)
     if not chunks:
         raise HTTPException(
             status_code=422,
             detail="No extractable text was found. Upload a text-based PDF, DOCX, TXT, or Markdown file.",
         )
-    doc_id = str(uuid.uuid4())
-    name = file.filename or "document.txt"
-    ensure_collection()
-    vectors = get_embedder().embed_documents([chunk["text"] for chunk in chunks]) if chunks else []
-    logger.info("Embedded upload filename=%s vectors=%d", name, len(vectors))
-    points = [
-        models.PointStruct(
-            id=str(uuid.uuid4()),
-            vector=vector,
-            payload={"doc_id": doc_id, "doc_name": name, "text": chunk["text"], "chunk": index + 1, "page": chunk["page"], "extraction": chunk["extraction"]},
-        )
-        for index, (chunk, vector) in enumerate(zip(chunks, vectors))
-    ]
-    if points:
-        qdrant.upsert(collection_name=COLLECTION, points=points)
-    document = {"id": doc_id, "name": name, "type": Path(name).suffix.lstrip(".") or "txt", "size": len(content), "chunks": len(chunks), "tokens": len(text.split()), "status": "indexed", "tags": []}
+
+    # Insert document with 'processing' status and return immediately
+    document = {
+        "id": doc_id, "name": name, "type": doc_type, "size": len(content),
+        "status": "processing", "chunks": 0, "tokens": 0, "tags": [],
+    }
     with psycopg.connect(DATABASE_URL) as connection:
         connection.execute(
             "INSERT INTO documents (id, name, type, size, uploaded_at, status, chunks, tokens, tags) VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s)",
-            (doc_id, document["name"], document["type"], document["size"], document["status"], document["chunks"], document["tokens"], document["tags"]),
+            (doc_id, name, doc_type, len(content), "processing", 0, 0, []),
         )
+
+    # Schedule heavy processing (embedding + vector upsert) in background
+    asyncio.create_task(_process_document(doc_id, name, content, pages, chunks))
+
     return document
+
+
+async def _process_document(doc_id: str, name: str, content: bytes, pages: list, chunks: list) -> None:
+    """Background task: embed chunks, upsert to Qdrant, update DB status."""
+    try:
+        text = "\n".join(page["text"] for page in pages)
+        ocr_pages = sum(page["extraction"] == "ocr" for page in pages)
+        logger.info("Processing upload filename=%s bytes=%d pages=%d chunks=%d ocr_pages=%d", name, len(content), len(pages), len(chunks), ocr_pages)
+
+        ensure_collection()
+        vectors = await asyncio.to_thread(
+            get_embedder().embed_documents,
+            [chunk["text"] for chunk in chunks],
+        )
+        logger.info("Embedded upload filename=%s vectors=%d", name, len(vectors))
+
+        points = [
+            models.PointStruct(
+                id=str(uuid.uuid4()),
+                vector=vector,
+                payload={
+                    "doc_id": doc_id, "doc_name": name, "text": chunk["text"],
+                    "chunk": index + 1, "page": chunk["page"], "extraction": chunk["extraction"],
+                },
+            )
+            for index, (chunk, vector) in enumerate(zip(chunks, vectors))
+        ]
+        if points:
+            qdrant.upsert(collection_name=COLLECTION, points=points)
+
+        with psycopg.connect(DATABASE_URL) as connection:
+            connection.execute(
+                "UPDATE documents SET status = 'indexed', chunks = %s, tokens = %s WHERE id = %s",
+                (len(chunks), len(text.split()), doc_id),
+            )
+        logger.info("Indexed upload filename=%s doc_id=%s chunks=%d", name, doc_id, len(chunks))
+
+    except Exception:
+        logger.exception("Background processing failed for filename=%s doc_id=%s", name, doc_id)
+        try:
+            with psycopg.connect(DATABASE_URL) as connection:
+                connection.execute(
+                    "UPDATE documents SET status = 'error' WHERE id = %s",
+                    (doc_id,),
+                )
+        except Exception:
+            logger.exception("Failed to mark document as error: doc_id=%s", doc_id)
 
 
 @app.post("/api/chat")
 async def chat(payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
+
     if not query:
-        return {"answer": "Ask a question about your indexed documents.", "citations": []}
-    hits = search(query, document_ids=payload.get("document_ids"))
-    if not hits and payload.get("document_ids"):
-        hits = search(query)
-    answer = await generate_answer(query, hits)
-    citations = [{"docId": hit["doc_id"], "docName": hit["doc_name"], "page": hit.get("page", hit.get("chunk")), "chunk": hit["text"], "score": hit["score"]} for hit in hits]
-    return {"answer": answer, "citations": citations}
+        return {
+            "answer": "Ask a question about your indexed documents.",
+            "citations": []
+        }
+
+    document_ids = payload.get("document_ids")
+
+    print("\n========== CHAT ==========")
+    print("Query:", query)
+    print("Document IDs:", document_ids)
+
+    try:
+        # 1. Search the knowledge base
+        hits = search(
+            query,
+            document_ids=document_ids
+        )
+
+        print("Initial hits:", len(hits))
+
+        # 2. If filtering by document IDs produced nothing,
+        # search the complete knowledge base
+        if not hits and document_ids:
+            print("No filtered results. Searching all documents...")
+            hits = search(query)
+
+        print("Final hits:", len(hits))
+
+        # 3. Show retrieved context
+        for i, hit in enumerate(hits[:5]):
+            print(f"\n--- HIT {i + 1} ---")
+            print("Document:", hit.get("doc_name"))
+            print("Doc ID:", hit.get("doc_id"))
+            print("Page:", hit.get("page"))
+            print("Score:", hit.get("score"))
+            print("Text:", hit.get("text", "")[:500])
+
+        # 4. Generate answer
+        answer = await generate_answer(
+            query,
+            hits
+        )
+
+        print("\nGenerated answer:", answer)
+        print("==========================\n")
+
+        # 5. Citations
+        citations = []
+
+        for hit in hits:
+            citations.append({
+                "docId": hit.get("doc_id"),
+                "docName": hit.get("doc_name"),
+                "page": hit.get("page", hit.get("chunk")),
+                "chunk": hit.get("text", ""),
+                "score": hit.get("score", 0)
+            })
+
+        return {
+            "answer": answer,
+            "citations": citations
+        }
+
+    except Exception as e:
+        print("CHAT ERROR:", repr(e))
+
+        return {
+            "answer": "An error occurred while processing your question.",
+            "citations": [],
+            "error": str(e)
+        }
